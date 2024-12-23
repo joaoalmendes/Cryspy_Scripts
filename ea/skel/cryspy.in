@@ -7,6 +7,13 @@ nstage = 1
 jobcmd = bash
 jobfile = job_cryspy
 
+[structure]
+struc_mode = crystal
+atype = Cs V Sb
+nat = 1 3 5
+natot = 9
+symprec = 0.01
+
 [ASE]
 ase_python = cryspy_runjob.py
 
