@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+#export PYTHONPATH="/home/borlido/Work/Code/pyMHM/src/interface/cryspy/:"$PYTHONPATH
+#export PYTHONPATH="/home/borlido/Work/Code/pyMHM/src/utils/:"$PYTHONPATH
+#
+## ---------- M3GNet
+#python3 cryspy_runjob.py
+#
+## ---------- CrySPY
+#sed -i -e '3 s/^.*$/done/' stat_job

@@ -1,0 +1,27 @@
+[basic]
+algo = EA
+calc_code = ASE
+tot_struc = 500
+njob = 500
+nstage = 1
+jobcmd = bash
+jobfile = job_cryspy
+
+[ASE]
+ase_python = cryspy_runjob.py
+
+[EA]
+n_pop = 120
+n_crsov = 50
+n_perm = 25
+n_strain = 25
+n_rand = 20
+n_elite = 10
+n_fittest = 35
+slct_func = TNM
+t_size = 4
+maxgen_ea = 10
+
+[option]
+
+

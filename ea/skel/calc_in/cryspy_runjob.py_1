@@ -1,0 +1,234 @@
+from ase.io import read, write
+from ase import Atoms
+
+import sys
+import numpy as np
+
+
+def check_too_close( atoms, radii=None, cutoff=10):
+    """ Check if the interatomic distances are too close.
+    Usefull for the NN. The criterium is rather arbitrary
+    though, since I do not know the correlation between
+    NN and DFT bond lenghts...
+    """
+    from is_connected import get_min_dist
+    from ase.data import covalent_radii, atomic_numbers
+    #
+    if radii is None:
+        radii = covalent_radii
+    #
+    min_dist = get_min_dist(atoms, cutoff)
+    
+    for pair in min_dist.keys():
+        radius_i = radii[ atomic_numbers[pair[0]] ]
+        radius_j = radii[ atomic_numbers[pair[1]] ]       
+        # The comparison distance
+        comp_dist = np.max( [radius_i, radius_j])*1.1
+        #
+        if (min_dist[pair] < comp_dist):
+            return True
+
+    return False
+
+
+def constant_shape_optimization(
+        structure: Atoms,
+        calculator,
+        imin: float= 0.7,
+        imax: float= 1.5,
+        nsteps: int= 40):
+    """"Perform a volume expansion of the structure and try to find a minima
+        within the given range. This might help some optimizations if the starting
+        volume is bad.
+    """
+    from ase.eos import EquationOfState
+
+    #
+    cell = structure.get_cell()
+    
+    # 
+    volumes = []
+    energies = []
+
+    # This should be within a try statement
+    for ifrac in np.linspace(imin, imax, nsteps):
+        streched = structure.copy()
+        streched.calc = calculator
+        streched.set_cell(cell * ifrac, scale_atoms=True)
+        #
+        volumes.append(streched.get_volume())
+        energies.append(streched.get_potential_energy()[0])
+
+    # Before fitting there must be a check to see if there
+    # is an actual minimum
+    eos = EquationOfState(volumes, energies)
+    v0, e0, B = eos.fit()
+
+    return v0
+
+
+def optimize(
+        structure: Atoms,
+        calculator,
+        potim: float= 0.2,
+        fmax: float= 0.01,
+        nsw: int= 1000,
+        constant_volume: bool= False,
+        fixsymmetry: bool= False,
+        pstress: float= 0.0):
+    """ 
+    A routine to run geometry optimization on a given structure
+    through ASE.
+    TODO: Add option for symmetry conserving optimization.
+
+    fmax:
+        maximum force to stop optimization
+    nsw:
+        maximum number of ionic steps
+    potim:
+        maximum step of atoms during atomic optimization
+    fixsymmetry:
+        If True, will use ASE's fixsymmtery constraint class
+        during the optimization.
+    pstress: float
+        pressure to apply during the optimization
+    """
+    from ase.constraints import ExpCellFilter
+    from ase.optimize.bfgs import BFGS
+    from ase.spacegroup.symmetrize import FixSymmetry
+
+    # Apply the fix symmetry constrain and set calculator
+    if (fixsymmetry):
+        structure.set_constraint(FixSymmetry(structure))
+
+    structure.calc = calculator
+    
+    # Build the unit cell filter to optimize cell
+    cellfilter = ExpCellFilter(
+        atoms= structure,
+        mask= None,
+        cell_factor= None,
+        hydrostatic_strain= False,
+        constant_volume= constant_volume,
+        scalar_pressure= pstress
+    )
+    
+    # Pass everything to the optimizer
+    # 20230727 - The maxstep should be constrained to avoid jumping too much to situations
+    # +where m3gnet will perform badly (too small or too large bonds)
+    # 20230727 - Not sure what the optimal optimizer should be 
+    optmizer_bfgs = BFGS(
+        atoms= cellfilter,
+        restart= None,
+        logfile = "-",
+        trajectory = None,
+        maxstep = potim,
+        master = None,
+        alpha = None
+    )
+
+    # Run the optimization
+    # 20230727 - Maximum force tightened a bit to improve symmetry of optimized cells.
+    # +This should not take too much extra time.
+    optmizer_bfgs.run(fmax= fmax, steps= nsw)
+
+    return 0
+
+
+if __name__=="__main__":
+    from ase.neighborlist import neighbor_list
+    from ase.data import covalent_radii
+
+    from remote_calculator import RemoteCalculator
+    from refine_symmetry import refine_symmetry_w_energy
+    from is_connected import is_connected, get_min_dist
+
+    import pickle
+    import json
+    import sys
+
+    # Hardcoded variables
+    neighbour_cutoff = 5 # Cutoff for neighbour search
+    fmax = 0.01
+
+    # The connection string should be edited accordingly
+    connection = str(sys.argv[1])
+    #connection = "http://aiken:5432/predict"
+    #connection = "http://127.0.0.1:5432/predict"
+    calculator = RemoteCalculator(connection= connection, thr_forces= 5e4)
+
+    # CrySpy always builds a POSCAR
+    structure = read("POSCAR")
+
+    # optimize without spg constraints
+    optimize(
+        structure= structure,
+        calculator= calculator,
+        potim= 0.1,
+        fmax= fmax,
+        nsw= 500,
+        constant_volume = False,
+        fixsymmetry = True,
+        pstress= 0.0)
+
+    # Print relevant information
+    write("CONTCAR", structure, vasp5=True, direct=True)
+
+    # Space group refinning
+    items = refine_symmetry_w_energy(
+        atoms=structure,
+        calculator=calculator,
+        tolmin=1e-6,
+        tolmax=5e-1,
+        ntol=20,
+        verbose=False)
+
+    # The MACE calculator is wrongly returning a list but to avoid reinicialization
+    # we allow it...
+    try:
+        e_tot = structure.get_potential_energy()[0]
+    except:
+        e_tot = structure.get_potential_energy()
+
+    # There are 3 typical problems with the NN: i) too close atoms that
+    # give energies similar to the ones of good structures; ii) Optimizations
+    # that go on forever leading to unconverged structures; iii) unconnected
+    # structures. These are easy to filter in principle but for runs under
+    # pressure not sure which criteria to use for i)...
+    converged_ionic = np.max(np.abs(structure.get_forces())) < fmax 
+
+    # smallest distance of nearest neighbours
+    min_dist =  np.min( neighbor_list('d', structure, neighbour_cutoff) )
+
+    to_close = check_too_close(
+            atoms= structure,
+            radii= None,
+            cutoff= 5)
+
+    # Is the structure connected
+    connected = is_connected(structure)
+
+    # Print the data for safekeeping; even if it is a band structure
+    data = {}
+    data["atoms"] = structure
+    data["natoms"] = len(structure)
+    data["etot"] = e_tot
+    data["eatom"] = e_tot / len(structure)
+    data["forces"] = structure.get_forces()
+    data["fmax"] = np.max( np.abs( structure.get_forces() ) )
+    data["stress"] = structure.get_stress()
+    data["smax"] = np.max( np.abs( structure.get_stress() ) )
+    data["converged_ionic"] = converged_ionic
+    data["items"] = items
+    data["connected"] = connected
+    data["min_dis"] = get_min_dist( structure, cutoff=5)
+
+    with open("data.pkl.bz2", "wb") as fileout:
+        pickle.dump(data, fileout)
+
+    # Check if bust...
+    if ( (to_close) or (not converged_ionic) or (not connected) ):
+        raise RuntimeError(f'Either atoms too close or unconverged')
+    else:
+        with open("log.tote", "w") as fileout:
+            print (e_tot, file= fileout)
